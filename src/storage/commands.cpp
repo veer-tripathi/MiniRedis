@@ -190,9 +190,11 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out) {
     if (ent) {
         if (ent->type != T_STR)
             return out_err(out, ERR_BAD_TYPE, "a non-string value exists");
+        aof_append(cmd);   // persist before swap — cmd[2] still holds the value
         ent->str.swap(cmd[2]);
         entry_set_ttl(ent, -1);
     } else {
+        aof_append(cmd);
         LookupKey key = make_lookup(cmd[1]);
         ent = entry_new(T_STR);
         ent->key.swap(key.key);
@@ -200,7 +202,6 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out) {
         ent->str.swap(cmd[2]);
         hm_insert(&g_data.db, &ent->node);
     }
-    aof_append(cmd);   // persist
     return out_nil(out);
 }
 

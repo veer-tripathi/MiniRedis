@@ -31,6 +31,14 @@ start_server() {
     sleep 0.3   # give the server time to bind
 }
 
+# restart_server: stop and restart WITHOUT deleting the AOF, so data survives.
+restart_server() {
+    stop_server
+    $SERVER &>/dev/null &
+    SERVER_PID=$!
+    sleep 0.3
+}
+
 stop_server() {
     if [ -n "$SERVER_PID" ]; then
         kill "$SERVER_PID" 2>/dev/null
@@ -266,8 +274,7 @@ check "before restart: zset"    "(dbl) 1"  "$(c zscore persist_zset alpha)"
 check "aof file exists"         "set"      "$(cat $AOF_FILE 2>/dev/null | head -1)"
 
 # Restart server — it will replay the AOF
-stop_server
-start_server
+restart_server
 
 # Verify data survived the restart
 check "after restart: string"   '"hello"'  "$(c get persist_key)"
