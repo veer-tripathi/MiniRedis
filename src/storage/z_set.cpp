@@ -11,7 +11,12 @@
 // ---------------------------------------------------------------------------
 
 static ZNode *znode_new(const char *name, size_t len, double score) {
-    ZNode *node = (ZNode *)malloc(sizeof(ZNode) + len);
+    // Allocate struct + name bytes as a flat byte array, then placement-new
+    // the ZNode into it. This avoids the flexible-array-member + malloc
+    // pattern that causes heap corruption when adjacent buffer allocations
+    // overwrite the struct fields.
+    uint8_t *mem  = new uint8_t[sizeof(ZNode) + len];
+    ZNode   *node = new (mem) ZNode();   // placement new — zero-inits all fields
     avl_init(&node->tree);
     node->hmap.next  = nullptr;
     node->hmap.hcode = str_hash((const uint8_t *)name, len);
@@ -21,7 +26,10 @@ static ZNode *znode_new(const char *name, size_t len, double score) {
     return node;
 }
 
-static void znode_del(ZNode *node) { free(node); }
+static void znode_del(ZNode *node) {
+    node->~ZNode();                      // explicit destructor
+    delete[] reinterpret_cast<uint8_t *>(node);
+}
 
 // ---------------------------------------------------------------------------
 // Comparator: lexicographic (score, name) ordering
