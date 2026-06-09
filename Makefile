@@ -13,6 +13,7 @@ SERVER_SRCS := \
     src/storage/h_map.cpp \
     src/storage/z_set.cpp \
     src/storage/commands.cpp \
+    src/persistence/persistence.cpp \
     src/protocol/serializer.cpp \
     src/utils/buffer.cpp \
     src/utils/logging.cpp

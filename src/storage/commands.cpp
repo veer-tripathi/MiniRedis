@@ -6,6 +6,7 @@
 #include "../timers/timers.h"
 #include "../protocol/serializer.h"
 #include "../utils/buffer.h"
+#include "../persistence/persistence.h"
 
 #include <algorithm>
 #include <cassert>
@@ -29,8 +30,6 @@ static struct {
 // ---------------------------------------------------------------------------
 // Pub/Sub channel registry
 // ---------------------------------------------------------------------------
-// Maps channel name → all Conn* currently subscribed to it.
-// Populated by SUBSCRIBE, cleaned up by UNSUBSCRIBE and conn_destroy().
 
 static std::unordered_map<std::string, std::vector<Conn *>> g_channels;
 
@@ -50,11 +49,10 @@ struct Entry {
     std::string key;
     uint32_t    type = T_INIT;
 
-    std::string             str;   // T_STR
-    ZSet                    zset;  // T_ZSET
-    std::deque<std::string> list;  // T_LIST
+    std::string             str;
+    ZSet                    zset;
+    std::deque<std::string> list;
 
-    // (size_t)-1 = no TTL
     size_t heap_idx = (size_t)-1;
 };
 
@@ -144,13 +142,6 @@ static bool is_expired(const Entry *ent) {
 // Pub/Sub helpers
 // ---------------------------------------------------------------------------
 
-// Write a Redis-compatible 3-element pub/sub array into a buffer.
-// Used for subscribe/unsubscribe confirmations and message delivery.
-//
-//   kind = "subscribe" | "unsubscribe" | "message"
-//   channel = channel name
-//   payload = subscription count (subscribe/unsubscribe) OR message body (message)
-//   is_message = true → payload is a string; false → payload is an integer
 static void write_pubsub_frame(Buffer *out,
                                 const std::string &kind,
                                 const std::string &channel,
@@ -166,15 +157,12 @@ static void write_pubsub_frame(Buffer *out,
         out_int(out, int_payload);
 }
 
-// Push a framed message into a subscriber's outgoing buffer and
-// mark the connection as wanting to write.
 static void push_to_subscriber(Conn *sub,
                                 const std::string &channel,
                                 const std::string &message)
 {
-    // Reserve a 4-byte length header, write the payload, then fill in the length.
     size_t header_pos = sub->outgoing.size();
-    buf_append_u32(&sub->outgoing, 0);   // placeholder
+    buf_append_u32(&sub->outgoing, 0);
 
     write_pubsub_frame(&sub->outgoing, "message", channel, 0, &message);
 
@@ -212,13 +200,17 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out) {
         ent->str.swap(cmd[2]);
         hm_insert(&g_data.db, &ent->node);
     }
+    aof_append(cmd);   // persist
     return out_nil(out);
 }
 
 static void do_del(std::vector<std::string> &cmd, Buffer *out) {
     LookupKey key  = make_lookup(cmd[1]);
     Hnode    *node = hm_delete(&g_data.db, &key.node, entry_eq);
-    if (node) entry_del(container_of(node, Entry, node));
+    if (node) {
+        entry_del(container_of(node, Entry, node));
+        aof_append(cmd);   // only persist if something was actually deleted
+    }
     return out_int(out, node ? 1 : 0);
 }
 
@@ -230,7 +222,7 @@ static void do_keys(std::vector<std::string> & /*cmd*/, Buffer *out) {
         if (!is_expired(ent)) count++;
     });
 
-    // Pass 2: emit (two passes needed because out_arr writes count header first)
+    // Pass 2: emit
     out_arr(out, count);
     hm_for_each(&g_data.db, [&](Hnode *node) {
         Entry *ent = container_of(node, Entry, node);
@@ -268,6 +260,7 @@ static void do_lpush(std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = get_or_create_list(cmd[1], out);
     if (!ent) return;
     ent->list.push_front(cmd[2]);
+    aof_append(cmd);
     return out_int(out, (int64_t)ent->list.size());
 }
 
@@ -275,6 +268,7 @@ static void do_rpush(std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = get_or_create_list(cmd[1], out);
     if (!ent) return;
     ent->list.push_back(cmd[2]);
+    aof_append(cmd);
     return out_int(out, (int64_t)ent->list.size());
 }
 
@@ -293,6 +287,7 @@ static void do_lpop(std::vector<std::string> &cmd, Buffer *out) {
         hm_delete(&g_data.db, &lk.node, entry_eq);
         entry_del(ent);
     }
+    aof_append(cmd);
     return out_str(out, val.data(), val.size());
 }
 
@@ -311,6 +306,7 @@ static void do_rpop(std::vector<std::string> &cmd, Buffer *out) {
         hm_delete(&g_data.db, &lk.node, entry_eq);
         entry_del(ent);
     }
+    aof_append(cmd);
     return out_str(out, val.data(), val.size());
 }
 
@@ -382,6 +378,7 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer *out) {
 
     const std::string &name = cmd[3];
     bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
+    aof_append(cmd);
     return out_int(out, (int64_t)added);
 }
 
@@ -390,7 +387,10 @@ static void do_zrem(std::vector<std::string> &cmd, Buffer *out) {
     if (!zset) return out_err(out, ERR_BAD_TYPE, "expect zset");
     const std::string &name = cmd[2];
     ZNode *znode = zset_lookup(zset, name.data(), name.size());
-    if (znode) zset_delete(zset, znode);
+    if (znode) {
+        zset_delete(zset, znode);
+        aof_append(cmd);   // only persist if something was actually removed
+    }
     return out_int(out, znode ? 1 : 0);
 }
 
@@ -445,6 +445,7 @@ static void do_expire(std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_int(out, 0);
     entry_set_ttl(ent, ttl_ms);
+    aof_append(cmd);
     return out_int(out, 1);
 }
 
@@ -463,20 +464,21 @@ static void do_persist(std::vector<std::string> &cmd, Buffer *out) {
     if (!ent) return out_int(out, 0);
     if (ent->heap_idx == (size_t)-1) return out_int(out, 0);
     entry_set_ttl(ent, -1);
+    aof_append(cmd);
     return out_int(out, 1);
 }
 
 // ---------------------------------------------------------------------------
 // Pub/Sub commands
 // ---------------------------------------------------------------------------
+// SUBSCRIBE and PUBLISH are intentionally NOT persisted to the AOF.
+// Subscriptions are transient connection state — they can't be replayed.
+// Published messages are fire-and-forget — replaying them on startup
+// would deliver them to nobody since there are no subscribers yet.
 
-// subscribe <channel>
-// Puts the connection into subscriber mode for the given channel.
-// Confirmation: [subscribe, channel, total_subscription_count]
 static void do_subscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     const std::string &channel = cmd[1];
 
-    // Idempotent — no-op if already subscribed
     auto &subs = conn->subscriptions;
     if (std::find(subs.begin(), subs.end(), channel) == subs.end()) {
         subs.push_back(channel);
@@ -484,39 +486,27 @@ static void do_subscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn)
     }
 
     conn->is_subscriber = true;
-
-    // Confirmation
     write_pubsub_frame(out, "subscribe", channel, (int64_t)subs.size(), nullptr);
 }
 
-// unsubscribe <channel>
-// Removes the connection from the channel's subscriber list.
-// Confirmation: [unsubscribe, channel, remaining_subscription_count]
-// If no subscriptions remain, connection returns to normal request/reply mode.
 static void do_unsubscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     const std::string &channel = cmd[1];
 
-    // Remove from conn's subscription list
     auto &subs = conn->subscriptions;
     auto  it   = std::find(subs.begin(), subs.end(), channel);
     if (it != subs.end()) subs.erase(it);
 
-    // Remove conn from the channel registry
     auto ch_it = g_channels.find(channel);
     if (ch_it != g_channels.end()) {
         auto &vec = ch_it->second;
         vec.erase(std::remove(vec.begin(), vec.end(), conn), vec.end());
-        if (vec.empty()) g_channels.erase(ch_it);  // delete empty channel
+        if (vec.empty()) g_channels.erase(ch_it);
     }
 
     if (subs.empty()) conn->is_subscriber = false;
-
     write_pubsub_frame(out, "unsubscribe", channel, (int64_t)subs.size(), nullptr);
 }
 
-// publish <channel> <message>
-// Pushes message to all subscribers of channel.
-// Returns the number of clients that received it.
 static void do_publish(std::vector<std::string> &cmd, Buffer *out) {
     const std::string &channel = cmd[1];
     const std::string &message = cmd[2];
@@ -532,8 +522,6 @@ static void do_publish(std::vector<std::string> &cmd, Buffer *out) {
     return out_int(out, count);
 }
 
-// Called from conn_destroy() — removes conn from every channel it was
-// subscribed to. Prevents dangling Conn* pointers in g_channels.
 void pubsub_unsubscribe_all(Conn *conn) {
     for (const std::string &channel : conn->subscriptions) {
         auto it = g_channels.find(channel);
@@ -564,6 +552,11 @@ void expire_keys() {
         LookupKey lk = make_lookup(ent->key);
         hm_delete(&g_data.db, &lk.node, entry_eq);
         entry_del(ent);
+        // No aof_append here — expiry is time-based, not command-based.
+        // On replay, expired keys will simply not be replayed since
+        // the AOF already recorded their original expire command with
+        // the original ttl_ms. They will expire naturally during replay
+        // if the ttl has already passed, via lazy expiration.
     }
 }
 
@@ -575,13 +568,11 @@ uint64_t next_ttl_ms() {
 // ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
-// Subscriber connections only accept SUBSCRIBE and UNSUBSCRIBE.
-// Sending any other command while subscribed returns an error, matching
-// Redis behaviour.
 
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
-    // In subscriber mode only sub/unsub commands are permitted
-    if (conn->is_subscriber) {
+    // During AOF replay conn is nullptr — pub/sub commands are never
+    // replayed so this is safe. Guard here just in case.
+    if (conn && conn->is_subscriber) {
         if (cmd.size() == 2 && cmd[0] == "subscribe")
             return do_subscribe  (cmd, out, conn);
         if (cmd.size() == 2 && cmd[0] == "unsubscribe")

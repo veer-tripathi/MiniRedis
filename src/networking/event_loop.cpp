@@ -3,6 +3,7 @@
 #include "../utils/common.h"
 #include "../timers/timers.h"
 #include "../storage/commands.h"
+#include "../persistence/persistence.h"
 
 #include <cassert>
 #include <cerrno>
@@ -58,12 +59,10 @@ static void process_timers() {
     while (!dlist_empty(&g_data.idle_list)) {
         Conn    *conn   = container_of(g_data.idle_list.next, Conn, idle_node);
 
-        if (conn->is_subscriber) {
-            // Move to back so it doesn't block the front on the next tick
-            dlist_detach(&conn->idle_node);
-            dlist_insert_before(&g_data.idle_list, &conn->idle_node);
-            continue;
-        }
+        // Subscribers are exempt from the idle timeout.
+        // They may sit silently for a long time waiting for published messages.
+        // Once they unsubscribe they re-enter the normal timeout path.
+        if (conn->is_subscriber) break;
 
         uint64_t expire = conn->last_active_ms + k_idle_timeout_ms;
         if (expire > now_ms) break;
@@ -91,6 +90,9 @@ int main() {
     if (listen(fd, SOMAXCONN)) die("listen()");
 
     dlist_init(&g_data.idle_list);
+
+    // Replay existing AOF and open file for appending
+    aof_init("appendonly.aof");
 
     std::vector<struct pollfd> poll_args;
 
