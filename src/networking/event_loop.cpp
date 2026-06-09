@@ -58,10 +58,12 @@ static void process_timers() {
     while (!dlist_empty(&g_data.idle_list)) {
         Conn    *conn   = container_of(g_data.idle_list.next, Conn, idle_node);
 
-        // Subscribers are exempt from the idle timeout.
-        // They may sit silently for a long time waiting for published messages.
-        // Once they unsubscribe they re-enter the normal timeout path.
-        if (conn->is_subscriber) break;
+        if (conn->is_subscriber) {
+            // Move to back so it doesn't block the front on the next tick
+            dlist_detach(&conn->idle_node);
+            dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+            continue;
+        }
 
         uint64_t expire = conn->last_active_ms + k_idle_timeout_ms;
         if (expire > now_ms) break;
