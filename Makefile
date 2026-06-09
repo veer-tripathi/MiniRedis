@@ -14,7 +14,6 @@ SERVER_SRCS := \
     src/storage/z_set.cpp \
     src/storage/commands.cpp \
     src/persistence/persistence.cpp \
-    src/protocol/serializer.cpp \
     src/utils/buffer.cpp \
     src/utils/logging.cpp
 
@@ -24,7 +23,12 @@ SERVER_SRCS := \
 CLIENT_SRCS := client.cpp
 
 # ---------------------------------------------------------------------------
-# Tests (Commented out)
+# Subscriber  (pub/sub test helper)
+# ---------------------------------------------------------------------------
+SUBSCRIBER_SRCS := subscriber.cpp
+
+# ---------------------------------------------------------------------------
+# Tests
 # ---------------------------------------------------------------------------
 TEST_AVL_SRCS := \
     src/tests/test_offset.cpp \
@@ -40,10 +44,9 @@ TEST_PROTO_SRCS := \
 # ---------------------------------------------------------------------------
 # Targets
 # ---------------------------------------------------------------------------
-.PHONY: all clean # test
+.PHONY: all clean test
 
-# Removed test_avl and test_protocol from the default 'all' target
-all: server client 
+all: server client subscriber
 
 server: $(SERVER_SRCS)
 	$(CXX) $(CXXFLAGS) -o $@ $^
@@ -53,6 +56,10 @@ client: $(CLIENT_SRCS)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 	@echo "[OK] built client"
 
+subscriber: $(SUBSCRIBER_SRCS)
+	$(CXX) $(CXXFLAGS) -o $@ $^
+	@echo "[OK] built subscriber"
+
 test_avl: $(TEST_AVL_SRCS)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 	@echo "[OK] built test_avl"
@@ -61,14 +68,9 @@ test_protocol: $(TEST_PROTO_SRCS)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 	@echo "[OK] built test_protocol"
 
-test: test_avl test_protocol
-	@echo ""
-	@echo "=== Running test_avl ==="
-	./test_avl
-	@echo ""
-	@echo "=== Running test_protocol ==="
-	./test_protocol
+# Build everything then run the test suite
+test: all
+	@bash test.sh
 
-# Removed test executables from the clean target
 clean:
-	rm -f server client
+	rm -f server client subscriber test_avl test_protocol appendonly.aof
