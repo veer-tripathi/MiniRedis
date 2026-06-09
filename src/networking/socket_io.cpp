@@ -17,10 +17,6 @@
 
 static const size_t k_max_msg = 32 << 20;
 
-// ---------------------------------------------------------------------------
-// fd_set_nb
-// ---------------------------------------------------------------------------
-
 void fd_set_nb(int fd) {
     errno = 0;
     int flags = fcntl(fd, F_GETFL, 0);
@@ -29,12 +25,6 @@ void fd_set_nb(int fd) {
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     if (errno) die("fcntl F_SETFL error");
 }
-
-// ---------------------------------------------------------------------------
-// handle_accept
-// ---------------------------------------------------------------------------
-// idle_list is passed in from event_loop.cpp (where g_data lives).
-// We append the new Conn to the back of the idle list to start its timer.
 
 Conn *handle_accept(int fd, DList *idle_list) {
     struct sockaddr_in client_addr = {};
@@ -58,18 +48,14 @@ Conn *handle_accept(int fd, DList *idle_list) {
     conn->incoming  = buf_init();
     conn->outgoing  = buf_init();
 
-    // Start the idle timer — record when this connection was accepted
-    // and insert it at the back of the idle list.
     conn->last_active_ms = get_monotonic_msec();
     dlist_insert_before(idle_list, &conn->idle_node);
 
     return conn;
 }
 
-// ---------------------------------------------------------------------------
-// try_one_request
-// ---------------------------------------------------------------------------
-
+// try_one_request now passes conn into do_request so pub/sub commands
+// can mutate connection state and push to other connections.
 static bool try_one_request(Conn *conn) {
     if (conn->incoming.size() < 4) return false;
 
@@ -94,17 +80,13 @@ static bool try_one_request(Conn *conn) {
 
     size_t header_pos = conn->outgoing.size();
     buf_append_u32(&conn->outgoing, 0);
-    do_request(cmd, &conn->outgoing);
+    do_request(cmd, &conn->outgoing, conn);   // conn passed here
     uint32_t resp_len = (uint32_t)(conn->outgoing.size() - header_pos - 4);
     memcpy(conn->outgoing.data() + header_pos, &resp_len, 4);
 
     buf_consume(&conn->incoming, 4 + body_len);
     return true;
 }
-
-// ---------------------------------------------------------------------------
-// handle_read
-// ---------------------------------------------------------------------------
 
 void handle_read(Conn *conn) {
     uint8_t buf[64 * 1024];
@@ -134,10 +116,6 @@ void handle_read(Conn *conn) {
         handle_write(conn);
     }
 }
-
-// ---------------------------------------------------------------------------
-// handle_write
-// ---------------------------------------------------------------------------
 
 void handle_write(Conn *conn) {
     assert(conn->outgoing.size() > 0);

@@ -7,12 +7,14 @@
 #include "../protocol/serializer.h"
 #include "../utils/buffer.h"
 
+#include <algorithm>
 #include <cassert>
 #include <climits>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -21,8 +23,16 @@
 
 static struct {
     Hmap                  db;
-    std::vector<HeapItem> heap;   // min-heap of TTL expiry timestamps
+    std::vector<HeapItem> heap;
 } g_data;
+
+// ---------------------------------------------------------------------------
+// Pub/Sub channel registry
+// ---------------------------------------------------------------------------
+// Maps channel name → all Conn* currently subscribed to it.
+// Populated by SUBSCRIBE, cleaned up by UNSUBSCRIBE and conn_destroy().
+
+static std::unordered_map<std::string, std::vector<Conn *>> g_channels;
 
 // ---------------------------------------------------------------------------
 // Entry
@@ -38,34 +48,19 @@ enum EntryType {
 struct Entry {
     Hnode       node;
     std::string key;
-    uint32_t    type     = T_INIT;
+    uint32_t    type = T_INIT;
 
-    // T_STR
-    std::string str;
+    std::string             str;   // T_STR
+    ZSet                    zset;  // T_ZSET
+    std::deque<std::string> list;  // T_LIST
 
-    // T_ZSET
-    ZSet zset;
-
-    // T_LIST
-    // Front = index 0 = left side (lpush/lpop end).
-    // Back  = last index    = right side (rpush/rpop end).
-    std::deque<std::string> list;
-
-    // Index into g_data.heap[].
-    // (size_t)-1 means no TTL is set on this key.
+    // (size_t)-1 = no TTL
     size_t heap_idx = (size_t)-1;
 };
 
 // ---------------------------------------------------------------------------
-// entry_set_ttl
+// TTL heap management
 // ---------------------------------------------------------------------------
-// The only function that touches g_data.heap.
-//
-//  ttl_ms < 0  →  remove TTL (make key permanent)
-//  ttl_ms >= 0 →  set TTL to expire ttl_ms milliseconds from now
-//
-// HeapItem::ref points at &ent->heap_idx so the heap can update the
-// Entry's index whenever it moves the item around internally.
 
 static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
     if (ttl_ms < 0) {
@@ -91,7 +86,7 @@ static Entry *entry_new(uint32_t type) {
 }
 
 static void entry_del(Entry *ent) {
-    entry_set_ttl(ent, -1);   // remove from heap before freeing
+    entry_set_ttl(ent, -1);
     if (ent->type == T_ZSET) zset_clear(&ent->zset);
     delete ent;
 }
@@ -119,7 +114,7 @@ static LookupKey make_lookup(std::string &k) {
 }
 
 // ---------------------------------------------------------------------------
-// entry_get_or_expire  —  lazy expiration
+// Lazy expiration
 // ---------------------------------------------------------------------------
 
 static Entry *entry_get_or_expire(std::string &k) {
@@ -140,13 +135,54 @@ static Entry *entry_get_or_expire(std::string &k) {
     return ent;
 }
 
-// ---------------------------------------------------------------------------
-// is_expired  —  used by do_keys without deleting
-// ---------------------------------------------------------------------------
-
 static bool is_expired(const Entry *ent) {
     if (ent->heap_idx == (size_t)-1) return false;
     return get_monotonic_msec() >= g_data.heap[ent->heap_idx].val;
+}
+
+// ---------------------------------------------------------------------------
+// Pub/Sub helpers
+// ---------------------------------------------------------------------------
+
+// Write a Redis-compatible 3-element pub/sub array into a buffer.
+// Used for subscribe/unsubscribe confirmations and message delivery.
+//
+//   kind = "subscribe" | "unsubscribe" | "message"
+//   channel = channel name
+//   payload = subscription count (subscribe/unsubscribe) OR message body (message)
+//   is_message = true → payload is a string; false → payload is an integer
+static void write_pubsub_frame(Buffer *out,
+                                const std::string &kind,
+                                const std::string &channel,
+                                int64_t int_payload,
+                                const std::string *str_payload)
+{
+    out_arr(out, 3);
+    out_str(out, kind.data(), kind.size());
+    out_str(out, channel.data(), channel.size());
+    if (str_payload)
+        out_str(out, str_payload->data(), str_payload->size());
+    else
+        out_int(out, int_payload);
+}
+
+// Push a framed message into a subscriber's outgoing buffer and
+// mark the connection as wanting to write.
+static void push_to_subscriber(Conn *sub,
+                                const std::string &channel,
+                                const std::string &message)
+{
+    // Reserve a 4-byte length header, write the payload, then fill in the length.
+    size_t header_pos = sub->outgoing.size();
+    buf_append_u32(&sub->outgoing, 0);   // placeholder
+
+    write_pubsub_frame(&sub->outgoing, "message", channel, 0, &message);
+
+    uint32_t resp_len = (uint32_t)(sub->outgoing.size() - header_pos - 4);
+    memcpy(sub->outgoing.data() + header_pos, &resp_len, 4);
+
+    sub->want_write = true;
+    sub->want_read  = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +203,7 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out) {
         if (ent->type != T_STR)
             return out_err(out, ERR_BAD_TYPE, "a non-string value exists");
         ent->str.swap(cmd[2]);
-        entry_set_ttl(ent, -1);   // set clears any existing TTL
+        entry_set_ttl(ent, -1);
     } else {
         LookupKey key = make_lookup(cmd[1]);
         ent = entry_new(T_STR);
@@ -187,16 +223,14 @@ static void do_del(std::vector<std::string> &cmd, Buffer *out) {
 }
 
 static void do_keys(std::vector<std::string> & /*cmd*/, Buffer *out) {
-    // Pass 1: count only live (non-expired) keys
+    // Pass 1: count live keys only
     uint32_t count = 0;
     hm_for_each(&g_data.db, [&](Hnode *node) {
         Entry *ent = container_of(node, Entry, node);
         if (!is_expired(ent)) count++;
     });
 
-    // Pass 2: emit the same filtered set
-    // out_arr must be written before the items because the wire format
-    // requires the count header first — so we need two passes.
+    // Pass 2: emit (two passes needed because out_arr writes count header first)
     out_arr(out, count);
     hm_for_each(&g_data.db, [&](Hnode *node) {
         Entry *ent = container_of(node, Entry, node);
@@ -209,8 +243,6 @@ static void do_keys(std::vector<std::string> & /*cmd*/, Buffer *out) {
 // List helpers
 // ---------------------------------------------------------------------------
 
-// Get the list entry for a key, or create it if it doesn't exist.
-// Returns nullptr on type error.
 static Entry *get_or_create_list(std::string &key_str, Buffer *out) {
     Entry *ent = entry_get_or_expire(key_str);
     if (ent) {
@@ -232,7 +264,6 @@ static Entry *get_or_create_list(std::string &key_str, Buffer *out) {
 // List commands
 // ---------------------------------------------------------------------------
 
-// lpush <key> <val>  — insert at front, return new length
 static void do_lpush(std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = get_or_create_list(cmd[1], out);
     if (!ent) return;
@@ -240,7 +271,6 @@ static void do_lpush(std::vector<std::string> &cmd, Buffer *out) {
     return out_int(out, (int64_t)ent->list.size());
 }
 
-// rpush <key> <val>  — insert at back, return new length
 static void do_rpush(std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = get_or_create_list(cmd[1], out);
     if (!ent) return;
@@ -248,7 +278,6 @@ static void do_rpush(std::vector<std::string> &cmd, Buffer *out) {
     return out_int(out, (int64_t)ent->list.size());
 }
 
-// lpop <key>  — remove and return front element, nil if empty/missing
 static void do_lpop(std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_nil(out);
@@ -259,17 +288,14 @@ static void do_lpop(std::vector<std::string> &cmd, Buffer *out) {
     std::string val = std::move(ent->list.front());
     ent->list.pop_front();
 
-    // Delete the key when the list becomes empty — matches Redis behaviour
     if (ent->list.empty()) {
         LookupKey lk = make_lookup(cmd[1]);
         hm_delete(&g_data.db, &lk.node, entry_eq);
         entry_del(ent);
     }
-
     return out_str(out, val.data(), val.size());
 }
 
-// rpop <key>  — remove and return back element, nil if empty/missing
 static void do_rpop(std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_nil(out);
@@ -285,11 +311,9 @@ static void do_rpop(std::vector<std::string> &cmd, Buffer *out) {
         hm_delete(&g_data.db, &lk.node, entry_eq);
         entry_del(ent);
     }
-
     return out_str(out, val.data(), val.size());
 }
 
-// llen <key>  — return number of elements, 0 if missing
 static void do_llen(std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_int(out, 0);
@@ -298,13 +322,8 @@ static void do_llen(std::vector<std::string> &cmd, Buffer *out) {
     return out_int(out, (int64_t)ent->list.size());
 }
 
-// lrange <key> <start> <stop>
-// Returns elements from index start to stop inclusive.
-// Negative indices count from the end: -1 = last, -2 = second to last, etc.
-// Out-of-range indices are clamped. Returns empty array if start > stop.
 static void do_lrange(std::vector<std::string> &cmd, Buffer *out) {
-    int64_t start = 0;
-    int64_t stop  = 0;
+    int64_t start = 0, stop = 0;
     try {
         start = std::stoll(cmd[2]);
         stop  = std::stoll(cmd[3]);
@@ -318,23 +337,16 @@ static void do_lrange(std::vector<std::string> &cmd, Buffer *out) {
         return out_err(out, ERR_BAD_TYPE, "not a list value");
 
     int64_t len = (int64_t)ent->list.size();
-
-    // Resolve negative indices
     if (start < 0) start += len;
     if (stop  < 0) stop  += len;
-
-    // Clamp to valid range
     if (start < 0) start = 0;
     if (stop >= len) stop = len - 1;
-
-    // Empty result cases
     if (start > stop || len == 0) return out_arr(out, 0);
 
     int64_t count = stop - start + 1;
     out_arr(out, (uint32_t)count);
-    for (int64_t i = start; i <= stop; i++) {
+    for (int64_t i = start; i <= stop; i++)
         out_str(out, ent->list[i].data(), ent->list[i].size());
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -430,10 +442,8 @@ static void do_expire(std::vector<std::string> &cmd, Buffer *out) {
     } catch (...) {
         return out_err(out, ERR_BAD_ARG, "expect int64");
     }
-
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_int(out, 0);
-
     entry_set_ttl(ent, ttl_ms);
     return out_int(out, 1);
 }
@@ -442,7 +452,6 @@ static void do_ttl(std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_int(out, -2);
     if (ent->heap_idx == (size_t)-1) return out_int(out, -1);
-
     uint64_t expire_at = g_data.heap[ent->heap_idx].val;
     uint64_t now       = get_monotonic_msec();
     int64_t  left      = (int64_t)(expire_at - now);
@@ -458,7 +467,87 @@ static void do_persist(std::vector<std::string> &cmd, Buffer *out) {
 }
 
 // ---------------------------------------------------------------------------
-// Active expiration — called by event_loop every tick
+// Pub/Sub commands
+// ---------------------------------------------------------------------------
+
+// subscribe <channel>
+// Puts the connection into subscriber mode for the given channel.
+// Confirmation: [subscribe, channel, total_subscription_count]
+static void do_subscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
+    const std::string &channel = cmd[1];
+
+    // Idempotent — no-op if already subscribed
+    auto &subs = conn->subscriptions;
+    if (std::find(subs.begin(), subs.end(), channel) == subs.end()) {
+        subs.push_back(channel);
+        g_channels[channel].push_back(conn);
+    }
+
+    conn->is_subscriber = true;
+
+    // Confirmation
+    write_pubsub_frame(out, "subscribe", channel, (int64_t)subs.size(), nullptr);
+}
+
+// unsubscribe <channel>
+// Removes the connection from the channel's subscriber list.
+// Confirmation: [unsubscribe, channel, remaining_subscription_count]
+// If no subscriptions remain, connection returns to normal request/reply mode.
+static void do_unsubscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
+    const std::string &channel = cmd[1];
+
+    // Remove from conn's subscription list
+    auto &subs = conn->subscriptions;
+    auto  it   = std::find(subs.begin(), subs.end(), channel);
+    if (it != subs.end()) subs.erase(it);
+
+    // Remove conn from the channel registry
+    auto ch_it = g_channels.find(channel);
+    if (ch_it != g_channels.end()) {
+        auto &vec = ch_it->second;
+        vec.erase(std::remove(vec.begin(), vec.end(), conn), vec.end());
+        if (vec.empty()) g_channels.erase(ch_it);  // delete empty channel
+    }
+
+    if (subs.empty()) conn->is_subscriber = false;
+
+    write_pubsub_frame(out, "unsubscribe", channel, (int64_t)subs.size(), nullptr);
+}
+
+// publish <channel> <message>
+// Pushes message to all subscribers of channel.
+// Returns the number of clients that received it.
+static void do_publish(std::vector<std::string> &cmd, Buffer *out) {
+    const std::string &channel = cmd[1];
+    const std::string &message = cmd[2];
+
+    auto it = g_channels.find(channel);
+    if (it == g_channels.end()) return out_int(out, 0);
+
+    int64_t count = 0;
+    for (Conn *sub : it->second) {
+        push_to_subscriber(sub, channel, message);
+        count++;
+    }
+    return out_int(out, count);
+}
+
+// Called from conn_destroy() — removes conn from every channel it was
+// subscribed to. Prevents dangling Conn* pointers in g_channels.
+void pubsub_unsubscribe_all(Conn *conn) {
+    for (const std::string &channel : conn->subscriptions) {
+        auto it = g_channels.find(channel);
+        if (it == g_channels.end()) continue;
+        auto &vec = it->second;
+        vec.erase(std::remove(vec.begin(), vec.end(), conn), vec.end());
+        if (vec.empty()) g_channels.erase(it);
+    }
+    conn->subscriptions.clear();
+    conn->is_subscriber = false;
+}
+
+// ---------------------------------------------------------------------------
+// Active expiration
 // ---------------------------------------------------------------------------
 
 static const size_t k_max_works = 2000;
@@ -486,24 +575,40 @@ uint64_t next_ttl_ms() {
 // ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
+// Subscriber connections only accept SUBSCRIBE and UNSUBSCRIBE.
+// Sending any other command while subscribed returns an error, matching
+// Redis behaviour.
 
-void do_request(std::vector<std::string> &cmd, Buffer *out) {
-    if      (cmd.size() == 2 && cmd[0] == "get")     return do_get    (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "set")     return do_set    (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "del")     return do_del    (cmd, out);
-    else if (cmd.size() == 1 && cmd[0] == "keys")    return do_keys   (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "lpush")   return do_lpush  (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "rpush")   return do_rpush  (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "lpop")    return do_lpop   (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "rpop")    return do_rpop   (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "llen")    return do_llen   (cmd, out);
-    else if (cmd.size() == 4 && cmd[0] == "lrange")  return do_lrange (cmd, out);
-    else if (cmd.size() == 4 && cmd[0] == "zadd")    return do_zadd   (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "zrem")    return do_zrem   (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "zscore")  return do_zscore (cmd, out);
-    else if (cmd.size() == 6 && cmd[0] == "zquery")  return do_zquery (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "expire")  return do_expire (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "ttl")     return do_ttl    (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "persist") return do_persist(cmd, out);
+void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
+    // In subscriber mode only sub/unsub commands are permitted
+    if (conn->is_subscriber) {
+        if (cmd.size() == 2 && cmd[0] == "subscribe")
+            return do_subscribe  (cmd, out, conn);
+        if (cmd.size() == 2 && cmd[0] == "unsubscribe")
+            return do_unsubscribe(cmd, out, conn);
+        return out_err(out, ERR_BAD_TYPE,
+                       "only SUBSCRIBE/UNSUBSCRIBE allowed in subscriber mode");
+    }
+
+    if      (cmd.size() == 2 && cmd[0] == "get")         return do_get      (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "set")         return do_set      (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "del")         return do_del      (cmd, out);
+    else if (cmd.size() == 1 && cmd[0] == "keys")        return do_keys     (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "lpush")       return do_lpush    (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "rpush")       return do_rpush    (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "lpop")        return do_lpop     (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "rpop")        return do_rpop     (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "llen")        return do_llen     (cmd, out);
+    else if (cmd.size() == 4 && cmd[0] == "lrange")      return do_lrange   (cmd, out);
+    else if (cmd.size() == 4 && cmd[0] == "zadd")        return do_zadd     (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "zrem")        return do_zrem     (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "zscore")      return do_zscore   (cmd, out);
+    else if (cmd.size() == 6 && cmd[0] == "zquery")      return do_zquery   (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "expire")      return do_expire   (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "ttl")         return do_ttl      (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "persist")     return do_persist  (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "subscribe")   return do_subscribe  (cmd, out, conn);
+    else if (cmd.size() == 2 && cmd[0] == "unsubscribe") return do_unsubscribe(cmd, out, conn);
+    else if (cmd.size() == 3 && cmd[0] == "publish")     return do_publish  (cmd, out);
     else    return out_err(out, ERR_UNKNOWN, "unknown command");
 }
