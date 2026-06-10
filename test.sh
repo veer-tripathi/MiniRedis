@@ -301,6 +301,53 @@ stop_server
 echo ""
 
 # ===========================================================================
+# [9] AOF compaction
+# ===========================================================================
+echo "[9] AOF compaction"
+
+start_server
+
+# Write a bunch of data including a key we'll delete and a list we'll shorten
+c set compact_str hello        >/dev/null
+c rpush compact_list a         >/dev/null
+c rpush compact_list b         >/dev/null
+c rpush compact_list c         >/dev/null
+c zadd  compact_zset 1.0 alpha >/dev/null
+c zadd  compact_zset 2.0 beta  >/dev/null
+c set   ghost_key   gone       >/dev/null
+c del   ghost_key              >/dev/null
+c rpush noisy_list  x          >/dev/null
+c rpush noisy_list  y          >/dev/null
+c rpush noisy_list  z          >/dev/null
+c del   noisy_list             >/dev/null
+
+# Sanity-check state before compaction
+check "pre-compact: string"   '"hello"'   "$(c get compact_str)"
+check "pre-compact: list len" "(int) 3"   "$(c llen compact_list)"
+check "pre-compact: zscore"   "(dbl) 1"   "$(c zscore compact_zset alpha)"
+check "pre-compact: ghost gone" "(nil)"   "$(c get ghost_key)"
+
+# Trigger compaction — this rewrites the AOF in-place
+c bgrewriteaof >/dev/null
+
+# AOF should now contain only live state (no ghost_key, no noisy_list)
+check "aof no ghost"  ""  "$(grep -c ghost_key $AOF_FILE || true)"
+check "aof no noisy"  ""  "$(grep -c noisy_list $AOF_FILE || true)"
+
+# Restart and verify everything survived
+restart_server
+
+check "post-compact restart: string"   '"hello"'   "$(c get compact_str)"
+check "post-compact restart: list len" "(int) 3"   "$(c llen compact_list)"
+check "post-compact restart: list[0]"  '"a"'       "$(c lrange compact_list 0 0)"
+check "post-compact restart: zscore"   "(dbl) 2"   "$(c zscore compact_zset beta)"
+check "post-compact restart: ghost"    "(nil)"     "$(c get ghost_key)"
+check "post-compact restart: noisy"    "(int) 0"   "$(c llen noisy_list)"
+
+stop_server
+echo ""
+
+# ===========================================================================
 # SUMMARY
 # ===========================================================================
 

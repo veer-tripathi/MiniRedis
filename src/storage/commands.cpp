@@ -469,6 +469,37 @@ static void do_persist(std::vector<std::string> &cmd, Buffer *out) {
     return out_int(out, 1);
 }
 
+// EXPIREAT <key> <absolute-monotonic-ms>
+// Used exclusively by AOF compaction replay — sets an absolute deadline
+// instead of a relative TTL so expiry survives a restart correctly.
+static void do_expireat(std::vector<std::string> &cmd, Buffer *out) {
+    uint64_t abs_ms = 0;
+    try {
+        abs_ms = (uint64_t)std::stoull(cmd[2]);
+    } catch (...) {
+        return out_err(out, ERR_BAD_ARG, "expect uint64");
+    }
+    Entry *ent = entry_get_or_expire(cmd[1]);
+    if (!ent) return out_int(out, 0);
+    // Set TTL relative to now so entry_set_ttl() computes the right deadline
+    uint64_t now = get_monotonic_msec();
+    int64_t  rel = (abs_ms > now) ? (int64_t)(abs_ms - now) : 1;
+    entry_set_ttl(ent, rel);
+    // Not appended to AOF — this command IS the compacted AOF line
+    return out_int(out, 1);
+}
+
+// BGREWRITEAOF
+// Rewrites the AOF as the minimal snapshot of current live state.
+static void do_bgrewriteaof(std::vector<std::string> &cmd, Buffer *out) {
+    (void)cmd;
+    bool ok = aof_compact("appendonly.aof");
+    if (ok)
+        return out_str(out, "Background append only file rewriting started", 45);
+    else
+        return out_err(out, ERR_UNKNOWN, "AOF compact failed");
+}
+
 // ---------------------------------------------------------------------------
 // Pub/Sub commands
 // ---------------------------------------------------------------------------
@@ -602,5 +633,42 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     else if (cmd.size() == 2 && cmd[0] == "subscribe")   return do_subscribe  (cmd, out, conn);
     else if (cmd.size() == 2 && cmd[0] == "unsubscribe") return do_unsubscribe(cmd, out, conn);
     else if (cmd.size() == 3 && cmd[0] == "publish")     return do_publish  (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "expireat")    return do_expireat (cmd, out);
+    else if (cmd.size() == 1 && cmd[0] == "bgrewriteaof") return do_bgrewriteaof(cmd, out);
     else    return out_err(out, ERR_UNKNOWN, "unknown command");
+}
+
+// ---------------------------------------------------------------------------
+// db_for_each_entry — snapshot iterator for AOF compaction
+// ---------------------------------------------------------------------------
+// Walks every live (non-expired) key in the hashmap and calls fn with
+// enough information to reconstruct each key in a fresh AOF.
+
+void db_for_each_entry(
+    std::function<void(
+        const std::string &key,
+        uint32_t           type,
+        const std::string &str,
+        const std::deque<std::string> &list,
+        AVLNode           *zset_root,
+        uint64_t           expire_at_ms
+    )> fn
+) {
+    hm_for_each(&g_data.db, [&](Hnode *node) {
+        Entry *ent = container_of(node, Entry, node);
+
+        // Skip already-expired keys
+        if (ent->heap_idx != (size_t)-1) {
+            if (get_monotonic_msec() >= g_data.heap[ent->heap_idx].val)
+                return;
+        }
+
+        uint64_t expire_at = (ent->heap_idx != (size_t)-1)
+            ? g_data.heap[ent->heap_idx].val
+            : 0;
+
+        fn(ent->key, ent->type, ent->str, ent->list,
+           ent->type == T_ZSET ? ent->zset.root : nullptr,
+           expire_at);
+    });
 }

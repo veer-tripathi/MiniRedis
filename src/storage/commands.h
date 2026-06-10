@@ -20,6 +20,31 @@ void do_request(std::vector<std::string> &cmd, Buffer *out);
 // and PUBLISH can write directly into subscriber outgoing buffers.
 void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn);
 
+// Iterate every live (non-expired) key in the database and call fn(key,
+// type, str, list, zset, expire_at_ms) where:
+//   key          — the key string
+//   type         — 1=string, 2=zset, 3=list
+//   str          — value if type==1, else ""
+//   list         — elements if type==3, else empty
+//   zset_root    — AVLNode* root of the ZSet AVL tree if type==2, else nullptr
+//   expire_at_ms — absolute monotonic-ms expiry, or 0 if no TTL
+// Used by aof_compact() to snapshot live state without coupling
+// persistence.cpp to the internal Entry struct.
+#include <functional>
+#include <string>
+#include <deque>
+#include "avl.h"
+void db_for_each_entry(
+    std::function<void(
+        const std::string &key,
+        uint32_t           type,
+        const std::string &str,
+        const std::deque<std::string> &list,
+        AVLNode           *zset_root,
+        uint64_t           expire_at_ms
+    )> fn
+);
+
 // Called by process_timers() every event loop tick.
 void expire_keys();
 

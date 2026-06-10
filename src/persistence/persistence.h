@@ -34,3 +34,10 @@ void aof_init(const char *path);
 // Only call this for commands that mutate state — not for reads.
 // tokens is the same cmd vector that was passed to do_request.
 void aof_append(const std::vector<std::string> &tokens);
+
+// Rewrite the AOF file as the minimal set of commands that reproduce
+// current in-memory state.  Writes to a temp file first, then atomically
+// renames it over the live AOF so there is never a window where the file
+// is missing or half-written.
+// Returns true on success, false on any I/O error.
+bool aof_compact(const char *path);
