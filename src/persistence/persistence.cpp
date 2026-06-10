@@ -115,7 +115,7 @@ void aof_init(const char *path) {
                 Buffer discard = buf_init();
                 // Pass a dummy Conn* — replay commands are never pub/sub
                 // (we don't persist subscribe/publish) so conn is unused.
-                do_request(cmd, &discard, nullptr);
+                do_request(cmd, &discard, nullptr, nullptr);
                 buf_free(&discard);
                 count++;
             }

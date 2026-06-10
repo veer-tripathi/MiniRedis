@@ -491,13 +491,24 @@ static void do_expireat(std::vector<std::string> &cmd, Buffer *out) {
 
 // BGREWRITEAOF
 // Rewrites the AOF as the minimal snapshot of current live state.
-static void do_bgrewriteaof(std::vector<std::string> &cmd, Buffer *out) {
+static void do_bgrewriteaof(std::vector<std::string> &cmd, Buffer *out,
+                             ThreadPool *tp) {
     (void)cmd;
-    bool ok = aof_compact("appendonly.aof");
-    if (ok)
+    if (tp) {
+        // Submit compaction to a worker thread — returns immediately so the
+        // event loop keeps serving other clients while compaction runs.
+        tp_submit(tp, []() {
+            aof_compact("appendonly.aof");
+        });
         return out_str(out, "Background append only file rewriting started", 45);
-    else
-        return out_err(out, ERR_UNKNOWN, "AOF compact failed");
+    } else {
+        // Fallback: no threadpool, run synchronously (blocks the event loop)
+        bool ok = aof_compact("appendonly.aof");
+        if (ok)
+            return out_str(out, "Background append only file rewriting started", 45);
+        else
+            return out_err(out, ERR_UNKNOWN, "AOF compact failed");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -601,7 +612,8 @@ uint64_t next_ttl_ms() {
 // Dispatcher
 // ---------------------------------------------------------------------------
 
-void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
+void do_request(std::vector<std::string> &cmd, Buffer *out,
+                Conn *conn, ThreadPool *tp) {
     // During AOF replay conn is nullptr — pub/sub commands are never
     // replayed so this is safe. Guard here just in case.
     if (conn && conn->is_subscriber) {
@@ -634,7 +646,7 @@ void do_request(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     else if (cmd.size() == 2 && cmd[0] == "unsubscribe") return do_unsubscribe(cmd, out, conn);
     else if (cmd.size() == 3 && cmd[0] == "publish")     return do_publish  (cmd, out);
     else if (cmd.size() == 3 && cmd[0] == "expireat")    return do_expireat (cmd, out);
-    else if (cmd.size() == 1 && cmd[0] == "bgrewriteaof") return do_bgrewriteaof(cmd, out);
+    else if (cmd.size() == 1 && cmd[0] == "bgrewriteaof") return do_bgrewriteaof(cmd, out, tp);
     else    return out_err(out, ERR_UNKNOWN, "unknown command");
 }
 

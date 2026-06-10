@@ -1,5 +1,6 @@
 CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -g -Isrc
+LDFLAGS  := -pthread
 
 # ---------------------------------------------------------------------------
 # Server
@@ -14,6 +15,7 @@ SERVER_SRCS := \
     src/storage/z_set.cpp \
     src/storage/commands.cpp \
     src/persistence/persistence.cpp \
+    src/threadpool/threadpool.cpp \
     src/utils/buffer.cpp \
     src/utils/logging.cpp
 
@@ -49,7 +51,7 @@ TEST_PROTO_SRCS := \
 all: server client subscriber
 
 server: $(SERVER_SRCS)
-	$(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "[OK] built server"
 
 client: $(CLIENT_SRCS)

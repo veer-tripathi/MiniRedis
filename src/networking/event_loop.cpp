@@ -4,6 +4,7 @@
 #include "../timers/timers.h"
 #include "../storage/commands.h"
 #include "../persistence/persistence.h"
+#include "../threadpool/threadpool.h"
 
 #include <cassert>
 #include <cerrno>
@@ -90,6 +91,10 @@ int main() {
     if (listen(fd, SOMAXCONN)) die("listen()");
 
     dlist_init(&g_data.idle_list);
+
+    // Create the threadpool — 4 workers for background tasks (BGREWRITEAOF etc.)
+    ThreadPool *tp = tp_create(4);
+    socket_io_set_threadpool(tp);
 
     // Replay existing AOF and open file for appending
     aof_init("appendonly.aof");

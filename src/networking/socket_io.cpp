@@ -3,6 +3,7 @@
 #include "../protocol/protocol.h"
 #include "../protocol/serializer.h"
 #include "../storage/commands.h"
+#include "../threadpool/threadpool.h"
 
 #include <cassert>
 #include <cerrno>
@@ -13,6 +14,12 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+
+// Global threadpool — set once at startup by socket_io_set_threadpool().
+// Passed into do_request so BGREWRITEAOF can offload compaction off-thread.
+static ThreadPool *g_tp = nullptr;
+
+void socket_io_set_threadpool(ThreadPool *tp) { g_tp = tp; }
 #include <netinet/ip.h>
 
 static const size_t k_max_msg = 32 << 20;
@@ -80,7 +87,7 @@ static bool try_one_request(Conn *conn) {
 
     size_t header_pos = conn->outgoing.size();
     buf_append_u32(&conn->outgoing, 0);
-    do_request(cmd, &conn->outgoing, conn);   // conn passed here
+    do_request(cmd, &conn->outgoing, conn, g_tp);   // conn + threadpool passed
     uint32_t resp_len = (uint32_t)(conn->outgoing.size() - header_pos - 4);
     memcpy(conn->outgoing.data() + header_pos, &resp_len, 4);
 

@@ -327,8 +327,9 @@ check "pre-compact: list len" "(int) 3"   "$(c llen compact_list)"
 check "pre-compact: zscore"   "(dbl) 1"   "$(c zscore compact_zset alpha)"
 check "pre-compact: ghost gone" "(nil)"   "$(c get ghost_key)"
 
-# Trigger compaction — this rewrites the AOF in-place
+# Trigger compaction — runs in background worker thread
 c bgrewriteaof >/dev/null
+sleep 0.5   # give the worker thread time to finish compaction
 
 # AOF should now contain only live state (no ghost_key, no noisy_list)
 check "aof no ghost"  ""  "$(grep -c ghost_key $AOF_FILE || true)"
