@@ -2,6 +2,8 @@
 
 #include "avl.h"
 #include "h_map.h"
+
+#include <string_view>
 #include <cstddef>
 
 // ---------------------------------------------------------------------------
@@ -37,17 +39,17 @@ struct ZSet {
 // BUG FIX: parameter order in original definition was (name, score, len)
 // but declaration and call sites used (name, len, score).  Canonical order
 // is now (name, len, score) everywhere.
-bool zset_insert(ZSet *zset, const char *name, size_t len, double score);
+bool zset_insert(ZSet *zset, std::string_view name, double score);
 
 // Look up a node by name.  Returns nullptr if not found.
-ZNode *zset_lookup(ZSet *zset, const char *name, size_t len);
+ZNode *zset_lookup(ZSet *zset, std::string_view name);
 
 // Remove `node` from the set (must belong to `zset`).
 void zset_delete(ZSet *zset, ZNode *node);
 
 // Find the first node >= (score, name) in sorted order.
 // Returns nullptr when the set is empty or all nodes are strictly less.
-ZNode *zset_seek(ZSet *zset, double score, const char *name, size_t len);
+ZNode *zset_seek(ZSet *zset, double score, std::string_view name);
 
 // Walk `offset` positions forward/backward from `znode` in sorted order.
 // Returns nullptr when the offset goes out of range.

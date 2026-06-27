@@ -378,7 +378,7 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer *out) {
     }
 
     const std::string &name = cmd[3];
-    bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
+    bool added = zset_insert(&ent->zset, name, score);
     aof_append(cmd);
     return out_int(out, (int64_t)added);
 }
@@ -387,7 +387,7 @@ static void do_zrem(std::vector<std::string> &cmd, Buffer *out) {
     ZSet *zset = expect_zset(cmd[1]);
     if (!zset) return out_err(out, ERR_BAD_TYPE, "expect zset");
     const std::string &name = cmd[2];
-    ZNode *znode = zset_lookup(zset, name.data(), name.size());
+    ZNode *znode = zset_lookup(zset, name);
     if (znode) {
         zset_delete(zset, znode);
         aof_append(cmd);   // only persist if something was actually removed
@@ -399,7 +399,7 @@ static void do_zscore(std::vector<std::string> &cmd, Buffer *out) {
     ZSet *zset = expect_zset(cmd[1]);
     if (!zset) return out_err(out, ERR_BAD_TYPE, "expect zset");
     const std::string &name = cmd[2];
-    ZNode *node = zset_lookup(zset, name.data(), name.size());
+    ZNode *node = zset_lookup(zset, name);
     return node ? out_dbl(out, node->score) : out_nil(out);
 }
 
@@ -413,7 +413,7 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer *out) {
     if (!zset) return out_err(out, ERR_BAD_TYPE, "expect zset");
     if (limit <= 0) return out_arr(out, 0);
 
-    ZNode *znode = zset_seek(zset, score, name.data(), name.size());
+    ZNode *znode = zset_seek(zset, score, name);
     znode = znode_offset(znode, offset);
 
     buf_append_u8(out, TAG_ARR);

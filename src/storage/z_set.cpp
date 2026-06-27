@@ -94,24 +94,24 @@ static bool hcmp(Hnode *node, Hnode *key) {
 // Public API
 // ---------------------------------------------------------------------------
 
-bool zset_insert(ZSet *zset, const char *name, size_t len, double score) {
-    ZNode *node = zset_lookup(zset, name, len);
+bool zset_insert(ZSet *zset, std::string_view name, double score) {
+    ZNode *node = zset_lookup(zset, name);
     if (node) {
         zset_update(zset, node, score);
         return false;
     }
-    node = znode_new(name, len, score);
+    node = znode_new(name.data(), name.size(), score);
     hm_insert(&zset->hmap, &node->hmap);
     tree_insert(zset, node);
     return true;
 }
 
-ZNode *zset_lookup(ZSet *zset, const char *name, size_t len) {
+ZNode *zset_lookup(ZSet *zset, std::string_view name) {
     if (!zset->root) return nullptr;
     HKey key;
-    key.len        = len;
-    key.name       = name;
-    key.node.hcode = str_hash((const uint8_t *)name, len);
+    key.len        = name.size();
+    key.name       = name.data();
+    key.node.hcode = str_hash((const uint8_t *)name.data(), name.size());
     Hnode *found   = hm_lookup(&zset->hmap, &key.node, hcmp);
     return found ? container_of(found, ZNode, hmap) : nullptr;
 }
@@ -127,10 +127,10 @@ void zset_delete(ZSet *zset, ZNode *node) {
     znode_del(node);
 }
 
-ZNode *zset_seek(ZSet *zset, double score, const char *name, size_t len) {
+ZNode *zset_seek(ZSet *zset, double score, std::string_view name) {
     AVLNode *found = nullptr;
     for (AVLNode *node = zset->root; node; ) {
-        if (zless(node, score, name, len)) {
+        if (zless(node, score, name.data(), name.size())) {
             node = node->right;
         } else {
             found = node;
