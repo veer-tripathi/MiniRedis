@@ -17,9 +17,11 @@
 
 // Global threadpool — set once at startup by socket_io_set_threadpool().
 // Passed into do_request so BGREWRITEAOF can offload compaction off-thread.
-static ThreadPool *g_tp = nullptr;
+// Stored as weak_ptr — socket_io borrows the pool, does not own it.
+// event_loop owns the shared_ptr; when it dies the pool shuts down.
+static std::weak_ptr<ThreadPool> g_tp;
 
-void socket_io_set_threadpool(ThreadPool *tp) { g_tp = tp; }
+void socket_io_set_threadpool(std::shared_ptr<ThreadPool> tp) { g_tp = tp; }
 #include <netinet/ip.h>
 
 static const size_t k_max_msg = 32 << 20;

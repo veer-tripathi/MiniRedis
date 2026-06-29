@@ -17,8 +17,10 @@
 // Parses cmd, executes it against g_data, writes the response into out.
 // conn   — needed for SUBSCRIBE / UNSUBSCRIBE / PUBLISH
 // tp     — threadpool used by BGREWRITEAOF to run compaction off-thread
-void do_request(std::vector<std::string> &cmd, Buffer *out,
-                Conn *conn, ThreadPool *tp);
+void do_request(const std::vector<std::string> &cmd,
+                Buffer *out,
+                Conn *conn,
+                std::weak_ptr<ThreadPool> tp);
 
 // ---------------------------------------------------------------------------
 // DB snapshot iterator (used by aof_compact)

@@ -492,17 +492,14 @@ static void do_expireat(std::vector<std::string> &cmd, Buffer *out) {
 // BGREWRITEAOF
 // Rewrites the AOF as the minimal snapshot of current live state.
 static void do_bgrewriteaof(std::vector<std::string> &cmd, Buffer *out,
-                             ThreadPool *tp) {
+                             std::weak_ptr<ThreadPool> tp) {
     (void)cmd;
-    if (tp) {
-        // Submit compaction to a worker thread — returns immediately so the
-        // event loop keeps serving other clients while compaction runs.
+    if (auto locked = tp.lock()) {
         tp_submit(tp, []() {
             aof_compact("appendonly.aof");
         });
         return out_str(out, "Background append only file rewriting started", 45);
     } else {
-        // Fallback: no threadpool, run synchronously (blocks the event loop)
         bool ok = aof_compact("appendonly.aof");
         if (ok)
             return out_str(out, "Background append only file rewriting started", 45);
@@ -613,7 +610,7 @@ uint64_t next_ttl_ms() {
 // ---------------------------------------------------------------------------
 
 void do_request(std::vector<std::string> &cmd, Buffer *out,
-                Conn *conn, ThreadPool *tp) {
+                Conn *conn,std::weak_ptr<ThreadPool> tp) {
     // During AOF replay conn is nullptr — pub/sub commands are never
     // replayed so this is safe. Guard here just in case.
     if (conn && conn->is_subscriber) {
