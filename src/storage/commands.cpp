@@ -104,7 +104,7 @@ static bool entry_eq(Hnode *node, Hnode *key) {
     return le->key == re->key;
 }
 
-static LookupKey make_lookup(std::string &k) {
+static LookupKey make_lookup(const std::string &k) {
     LookupKey lk;
     lk.key        = k;
     lk.node.hcode = str_hash((const uint8_t *)lk.key.data(), lk.key.size());
@@ -115,7 +115,7 @@ static LookupKey make_lookup(std::string &k) {
 // Lazy expiration
 // ---------------------------------------------------------------------------
 
-static Entry *entry_get_or_expire(std::string &k) {
+static Entry *entry_get_or_expire(const std::string &k) {
     LookupKey lk   = make_lookup(k);
     Hnode    *node = hm_lookup(&g_data.db, &lk.node, entry_eq);
     if (!node) return nullptr;
@@ -177,7 +177,7 @@ static void push_to_subscriber(Conn *sub,
 // String commands
 // ---------------------------------------------------------------------------
 
-static void do_get(std::vector<std::string> &cmd, Buffer *out) {
+static void do_get(const std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_nil(out);
     if (ent->type != T_STR)
@@ -185,13 +185,13 @@ static void do_get(std::vector<std::string> &cmd, Buffer *out) {
     return out_str(out, ent->str.data(), ent->str.size());
 }
 
-static void do_set(std::vector<std::string> &cmd, Buffer *out) {
+static void do_set(const std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (ent) {
         if (ent->type != T_STR)
             return out_err(out, ERR_BAD_TYPE, "a non-string value exists");
-        aof_append(cmd);   // persist before swap — cmd[2] still holds the value
-        ent->str.swap(cmd[2]);
+        aof_append(cmd);   // persist — cmd[2] is const so copy assign
+        ent->str = cmd[2];
         entry_set_ttl(ent, -1);
     } else {
         aof_append(cmd);
@@ -199,31 +199,29 @@ static void do_set(std::vector<std::string> &cmd, Buffer *out) {
         ent = entry_new(T_STR);
         ent->key.swap(key.key);
         ent->node.hcode = key.node.hcode;
-        ent->str.swap(cmd[2]);
+        ent->str = cmd[2];
         hm_insert(&g_data.db, &ent->node);
     }
     return out_nil(out);
 }
 
-static void do_del(std::vector<std::string> &cmd, Buffer *out) {
+static void do_del(const std::vector<std::string> &cmd, Buffer *out) {
     LookupKey key  = make_lookup(cmd[1]);
     Hnode    *node = hm_delete(&g_data.db, &key.node, entry_eq);
     if (node) {
         entry_del(container_of(node, Entry, node));
-        aof_append(cmd);   // only persist if something was actually deleted
+        aof_append(cmd);
     }
     return out_int(out, node ? 1 : 0);
 }
 
-static void do_keys(std::vector<std::string> & /*cmd*/, Buffer *out) {
-    // Pass 1: count live keys only
+static void do_keys(const std::vector<std::string> & /*cmd*/, Buffer *out) {
     uint32_t count = 0;
     hm_for_each(&g_data.db, [&](Hnode *node) {
         Entry *ent = container_of(node, Entry, node);
         if (!is_expired(ent)) count++;
     });
 
-    // Pass 2: emit
     out_arr(out, count);
     hm_for_each(&g_data.db, [&](Hnode *node) {
         Entry *ent = container_of(node, Entry, node);
@@ -236,7 +234,7 @@ static void do_keys(std::vector<std::string> & /*cmd*/, Buffer *out) {
 // List helpers
 // ---------------------------------------------------------------------------
 
-static Entry *get_or_create_list(std::string &key_str, Buffer *out) {
+static Entry *get_or_create_list(const std::string &key_str, Buffer *out) {
     Entry *ent = entry_get_or_expire(key_str);
     if (ent) {
         if (ent->type != T_LIST) {
@@ -257,7 +255,7 @@ static Entry *get_or_create_list(std::string &key_str, Buffer *out) {
 // List commands
 // ---------------------------------------------------------------------------
 
-static void do_lpush(std::vector<std::string> &cmd, Buffer *out) {
+static void do_lpush(const std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = get_or_create_list(cmd[1], out);
     if (!ent) return;
     ent->list.push_front(cmd[2]);
@@ -265,7 +263,7 @@ static void do_lpush(std::vector<std::string> &cmd, Buffer *out) {
     return out_int(out, (int64_t)ent->list.size());
 }
 
-static void do_rpush(std::vector<std::string> &cmd, Buffer *out) {
+static void do_rpush(const std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = get_or_create_list(cmd[1], out);
     if (!ent) return;
     ent->list.push_back(cmd[2]);
@@ -273,7 +271,7 @@ static void do_rpush(std::vector<std::string> &cmd, Buffer *out) {
     return out_int(out, (int64_t)ent->list.size());
 }
 
-static void do_lpop(std::vector<std::string> &cmd, Buffer *out) {
+static void do_lpop(const std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_nil(out);
     if (ent->type != T_LIST)
@@ -292,7 +290,7 @@ static void do_lpop(std::vector<std::string> &cmd, Buffer *out) {
     return out_str(out, val.data(), val.size());
 }
 
-static void do_rpop(std::vector<std::string> &cmd, Buffer *out) {
+static void do_rpop(const std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_nil(out);
     if (ent->type != T_LIST)
@@ -311,7 +309,7 @@ static void do_rpop(std::vector<std::string> &cmd, Buffer *out) {
     return out_str(out, val.data(), val.size());
 }
 
-static void do_llen(std::vector<std::string> &cmd, Buffer *out) {
+static void do_llen(const std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_int(out, 0);
     if (ent->type != T_LIST)
@@ -319,7 +317,7 @@ static void do_llen(std::vector<std::string> &cmd, Buffer *out) {
     return out_int(out, (int64_t)ent->list.size());
 }
 
-static void do_lrange(std::vector<std::string> &cmd, Buffer *out) {
+static void do_lrange(const std::vector<std::string> &cmd, Buffer *out) {
     int64_t start = 0, stop = 0;
     try {
         start = std::stoll(cmd[2]);
@@ -352,7 +350,7 @@ static void do_lrange(std::vector<std::string> &cmd, Buffer *out) {
 
 static const ZSet k_empty_zset;
 
-static ZSet *expect_zset(std::string &s) {
+static ZSet *expect_zset(const std::string &s) {
     Entry *ent = entry_get_or_expire(s);
     if (!ent) return (ZSet *)&k_empty_zset;
     return ent->type == T_ZSET ? &ent->zset : nullptr;
@@ -362,7 +360,7 @@ static ZSet *expect_zset(std::string &s) {
 // Sorted-set commands
 // ---------------------------------------------------------------------------
 
-static void do_zadd(std::vector<std::string> &cmd, Buffer *out) {
+static void do_zadd(const std::vector<std::string> &cmd, Buffer *out) {
     double score = std::stod(cmd[2]);
 
     Entry *ent = entry_get_or_expire(cmd[1]);
@@ -383,19 +381,19 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer *out) {
     return out_int(out, (int64_t)added);
 }
 
-static void do_zrem(std::vector<std::string> &cmd, Buffer *out) {
+static void do_zrem(const std::vector<std::string> &cmd, Buffer *out) {
     ZSet *zset = expect_zset(cmd[1]);
     if (!zset) return out_err(out, ERR_BAD_TYPE, "expect zset");
     const std::string &name = cmd[2];
     ZNode *znode = zset_lookup(zset, name);
     if (znode) {
         zset_delete(zset, znode);
-        aof_append(cmd);   // only persist if something was actually removed
+        aof_append(cmd);
     }
     return out_int(out, znode ? 1 : 0);
 }
 
-static void do_zscore(std::vector<std::string> &cmd, Buffer *out) {
+static void do_zscore(const std::vector<std::string> &cmd, Buffer *out) {
     ZSet *zset = expect_zset(cmd[1]);
     if (!zset) return out_err(out, ERR_BAD_TYPE, "expect zset");
     const std::string &name = cmd[2];
@@ -403,7 +401,7 @@ static void do_zscore(std::vector<std::string> &cmd, Buffer *out) {
     return node ? out_dbl(out, node->score) : out_nil(out);
 }
 
-static void do_zquery(std::vector<std::string> &cmd, Buffer *out) {
+static void do_zquery(const std::vector<std::string> &cmd, Buffer *out) {
     double             score  = std::stod(cmd[2]);
     const std::string &name   = cmd[3];
     int64_t            offset = std::stoi(cmd[4]);
@@ -436,7 +434,7 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer *out) {
 // TTL commands
 // ---------------------------------------------------------------------------
 
-static void do_expire(std::vector<std::string> &cmd, Buffer *out) {
+static void do_expire(const std::vector<std::string> &cmd, Buffer *out) {
     int64_t ttl_ms = 0;
     try {
         ttl_ms = std::stoll(cmd[2]);
@@ -450,7 +448,7 @@ static void do_expire(std::vector<std::string> &cmd, Buffer *out) {
     return out_int(out, 1);
 }
 
-static void do_ttl(std::vector<std::string> &cmd, Buffer *out) {
+static void do_ttl(const std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_int(out, -2);
     if (ent->heap_idx == (size_t)-1) return out_int(out, -1);
@@ -460,7 +458,7 @@ static void do_ttl(std::vector<std::string> &cmd, Buffer *out) {
     return out_int(out, left > 0 ? left : 0);
 }
 
-static void do_persist(std::vector<std::string> &cmd, Buffer *out) {
+static void do_persist(const std::vector<std::string> &cmd, Buffer *out) {
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_int(out, 0);
     if (ent->heap_idx == (size_t)-1) return out_int(out, 0);
@@ -469,10 +467,7 @@ static void do_persist(std::vector<std::string> &cmd, Buffer *out) {
     return out_int(out, 1);
 }
 
-// EXPIREAT <key> <absolute-monotonic-ms>
-// Used exclusively by AOF compaction replay — sets an absolute deadline
-// instead of a relative TTL so expiry survives a restart correctly.
-static void do_expireat(std::vector<std::string> &cmd, Buffer *out) {
+static void do_expireat(const std::vector<std::string> &cmd, Buffer *out) {
     uint64_t abs_ms = 0;
     try {
         abs_ms = (uint64_t)std::stoull(cmd[2]);
@@ -481,17 +476,17 @@ static void do_expireat(std::vector<std::string> &cmd, Buffer *out) {
     }
     Entry *ent = entry_get_or_expire(cmd[1]);
     if (!ent) return out_int(out, 0);
-    // Set TTL relative to now so entry_set_ttl() computes the right deadline
     uint64_t now = get_monotonic_msec();
     int64_t  rel = (abs_ms > now) ? (int64_t)(abs_ms - now) : 1;
     entry_set_ttl(ent, rel);
-    // Not appended to AOF — this command IS the compacted AOF line
     return out_int(out, 1);
 }
 
+// ---------------------------------------------------------------------------
 // BGREWRITEAOF
-// Rewrites the AOF as the minimal snapshot of current live state.
-static void do_bgrewriteaof(std::vector<std::string> &cmd, Buffer *out,
+// ---------------------------------------------------------------------------
+
+static void do_bgrewriteaof(const std::vector<std::string> &cmd, Buffer *out,
                              std::weak_ptr<ThreadPool> tp) {
     (void)cmd;
     if (auto locked = tp.lock()) {
@@ -511,12 +506,8 @@ static void do_bgrewriteaof(std::vector<std::string> &cmd, Buffer *out,
 // ---------------------------------------------------------------------------
 // Pub/Sub commands
 // ---------------------------------------------------------------------------
-// SUBSCRIBE and PUBLISH are intentionally NOT persisted to the AOF.
-// Subscriptions are transient connection state — they can't be replayed.
-// Published messages are fire-and-forget — replaying them on startup
-// would deliver them to nobody since there are no subscribers yet.
 
-static void do_subscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
+static void do_subscribe(const std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     const std::string &channel = cmd[1];
 
     auto &subs = conn->subscriptions;
@@ -529,7 +520,7 @@ static void do_subscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn)
     write_pubsub_frame(out, "subscribe", channel, (int64_t)subs.size(), nullptr);
 }
 
-static void do_unsubscribe(std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
+static void do_unsubscribe(const std::vector<std::string> &cmd, Buffer *out, Conn *conn) {
     const std::string &channel = cmd[1];
 
     auto &subs = conn->subscriptions;
@@ -547,7 +538,7 @@ static void do_unsubscribe(std::vector<std::string> &cmd, Buffer *out, Conn *con
     write_pubsub_frame(out, "unsubscribe", channel, (int64_t)subs.size(), nullptr);
 }
 
-static void do_publish(std::vector<std::string> &cmd, Buffer *out) {
+static void do_publish(const std::vector<std::string> &cmd, Buffer *out) {
     const std::string &channel = cmd[1];
     const std::string &message = cmd[2];
 
@@ -592,11 +583,6 @@ void expire_keys() {
         LookupKey lk = make_lookup(ent->key);
         hm_delete(&g_data.db, &lk.node, entry_eq);
         entry_del(ent);
-        // No aof_append here — expiry is time-based, not command-based.
-        // On replay, expired keys will simply not be replayed since
-        // the AOF already recorded their original expire command with
-        // the original ttl_ms. They will expire naturally during replay
-        // if the ttl has already passed, via lazy expiration.
     }
 }
 
@@ -609,10 +595,8 @@ uint64_t next_ttl_ms() {
 // Dispatcher
 // ---------------------------------------------------------------------------
 
-void do_request(std::vector<std::string> &cmd, Buffer *out,
-                Conn *conn,std::weak_ptr<ThreadPool> tp) {
-    // During AOF replay conn is nullptr — pub/sub commands are never
-    // replayed so this is safe. Guard here just in case.
+void do_request(const std::vector<std::string> &cmd, Buffer *out,
+                Conn *conn, std::weak_ptr<ThreadPool> tp) {
     if (conn && conn->is_subscriber) {
         if (cmd.size() == 2 && cmd[0] == "subscribe")
             return do_subscribe  (cmd, out, conn);
@@ -622,36 +606,34 @@ void do_request(std::vector<std::string> &cmd, Buffer *out,
                        "only SUBSCRIBE/UNSUBSCRIBE allowed in subscriber mode");
     }
 
-    if      (cmd.size() == 2 && cmd[0] == "get")         return do_get      (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "set")         return do_set      (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "del")         return do_del      (cmd, out);
-    else if (cmd.size() == 1 && cmd[0] == "keys")        return do_keys     (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "lpush")       return do_lpush    (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "rpush")       return do_rpush    (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "lpop")        return do_lpop     (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "rpop")        return do_rpop     (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "llen")        return do_llen     (cmd, out);
-    else if (cmd.size() == 4 && cmd[0] == "lrange")      return do_lrange   (cmd, out);
-    else if (cmd.size() == 4 && cmd[0] == "zadd")        return do_zadd     (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "zrem")        return do_zrem     (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "zscore")      return do_zscore   (cmd, out);
-    else if (cmd.size() == 6 && cmd[0] == "zquery")      return do_zquery   (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "expire")      return do_expire   (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "ttl")         return do_ttl      (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "persist")     return do_persist  (cmd, out);
-    else if (cmd.size() == 2 && cmd[0] == "subscribe")   return do_subscribe  (cmd, out, conn);
-    else if (cmd.size() == 2 && cmd[0] == "unsubscribe") return do_unsubscribe(cmd, out, conn);
-    else if (cmd.size() == 3 && cmd[0] == "publish")     return do_publish  (cmd, out);
-    else if (cmd.size() == 3 && cmd[0] == "expireat")    return do_expireat (cmd, out);
+    if      (cmd.size() == 2 && cmd[0] == "get")          return do_get        (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "set")          return do_set        (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "del")          return do_del        (cmd, out);
+    else if (cmd.size() == 1 && cmd[0] == "keys")         return do_keys       (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "lpush")        return do_lpush      (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "rpush")        return do_rpush      (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "lpop")         return do_lpop       (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "rpop")         return do_rpop       (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "llen")         return do_llen       (cmd, out);
+    else if (cmd.size() == 4 && cmd[0] == "lrange")       return do_lrange     (cmd, out);
+    else if (cmd.size() == 4 && cmd[0] == "zadd")         return do_zadd       (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "zrem")         return do_zrem       (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "zscore")       return do_zscore     (cmd, out);
+    else if (cmd.size() == 6 && cmd[0] == "zquery")       return do_zquery     (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "expire")       return do_expire     (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "ttl")          return do_ttl        (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "persist")      return do_persist    (cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "subscribe")    return do_subscribe  (cmd, out, conn);
+    else if (cmd.size() == 2 && cmd[0] == "unsubscribe")  return do_unsubscribe(cmd, out, conn);
+    else if (cmd.size() == 3 && cmd[0] == "publish")      return do_publish    (cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "expireat")     return do_expireat   (cmd, out);
     else if (cmd.size() == 1 && cmd[0] == "bgrewriteaof") return do_bgrewriteaof(cmd, out, tp);
-    else    return out_err(out, ERR_UNKNOWN, "unknown command");
+    else return out_err(out, ERR_UNKNOWN, "unknown command");
 }
 
 // ---------------------------------------------------------------------------
-// db_for_each_entry — snapshot iterator for AOF compaction
+// db_for_each_entry
 // ---------------------------------------------------------------------------
-// Walks every live (non-expired) key in the hashmap and calls fn with
-// enough information to reconstruct each key in a fresh AOF.
 
 void db_for_each_entry(
     std::function<void(
@@ -666,7 +648,6 @@ void db_for_each_entry(
     hm_for_each(&g_data.db, [&](Hnode *node) {
         Entry *ent = container_of(node, Entry, node);
 
-        // Skip already-expired keys
         if (ent->heap_idx != (size_t)-1) {
             if (get_monotonic_msec() >= g_data.heap[ent->heap_idx].val)
                 return;
